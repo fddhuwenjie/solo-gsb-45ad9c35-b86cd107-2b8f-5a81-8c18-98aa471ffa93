@@ -9,6 +9,9 @@
 安全的下一步动作。
 另提供**部署身份预检**：在规划前校验目标叶证书的 SAN 是否覆盖端点声明的
 DNS/IP 身份，并沿链累计中间 CA 的名称约束（excluded 优先、permitted 取交集）。
+还提供**离线 OCSP 装订预检**：不联系响应方，核对装订 OCSP 响应的 CertID、
+授权签名者（签发者本人或直接签发且含 id-kp-OCSPSigning 的委托响应证书）、
+签名、certStatus 与新鲜度窗口，决定该响应是否可随目标叶一起部署。
 
 ## 一键启动
 
@@ -194,6 +197,101 @@ curl -s http://localhost:8080/deployments/precheck \
 `pem_issues` / `fingerprint_issues` / `chain_issues`），并额外提供
 `identity_issues`（非法 DNS/IP 身份、重复身份，错误码 `invalid_identity`）；
 链无法唯一解析时同样返回 `no_trust_path` / `ambiguous_chain`。
+
+### `POST /deployments/ocsp-precheck` — 离线预检 OCSP 装订响应
+
+在部署前**完全离线**校验一张目标叶证书的 OCSP 装订响应（RFC 6960），无需联系
+任何响应方。输入与归一化接口同款的 PEM 包（复用其解析、去重与签名验证原语），
+外加叶指纹、Base64 DER OCSP 响应、校验时刻与最多 300 秒的时钟偏差：
+
+```bash
+curl -s http://localhost:8080/deployments/ocsp-precheck \
+  -H 'Content-Type: application/json' \
+  --data @examples/ocsp_precheck_request.json
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `pem_certificates` | PEM 字符串列表，规则同 `/scenarios/normalize`；需包含目标叶及其签发者 |
+| `leaf_fingerprint` | 响应所应描述的叶证书 SHA-256 指纹（十六进制，大小写不敏感） |
+| `ocsp_response` | 装订在握手上的 Base64 DER OCSP 响应（容忍换行空白） |
+| `check_time` | 校验时刻（ISO-8601，建议带时区；裸时间按 UTC，输出统一归一化为 UTC） |
+| `allowed_skew_seconds` | 响应方时钟偏差容忍，`0..300`，缺省 `300`，对新鲜度窗口两侧对称放宽 |
+
+校验严格按 RFC 6960 逐层进行：
+
+1. **CertID 必须点名该叶**：序列号必须与叶证书一致；`issuerNameHash` 与
+   `issuerKeyHash`（按 CertID 自带的哈希算法重新计算，名字哈希覆盖签发者 DN、
+   密钥哈希覆盖 subjectPublicKey BIT STRING 内容）必须同时命中 PEM 包中一张
+   **密码学上真正签发了该叶**的证书——只比对 DN 或只比对密钥都不足以通过。
+2. **按 ResponderID 选定签名者**：只接受两类——①叶的签发者本身（byName 匹配
+   subject DN，或 byKey 匹配其公钥 SHA-1，CA 自签 OCSP 无需 EKU）；②响应内嵌的
+   委托响应证书，必须**由该签发者直接签发**、在 `check_time` 处于有效期内、
+   且含 `id-kp-OCSPSigning`（1.3.6.1.5.5.7.3.9）扩展。
+3. **验签**：用选定签名者公钥验证 BasicOCSPResponse 对 responseData 的签名
+   （RSA PKCS#1 v1.5、RSA-PSS、ECDSA、DSA、Ed25519/Ed448；PSS 参数直接按
+   RFC 4055 从原始 AlgorithmIdentifier 解析，MGF1 摘要必须一致，无法解析即失败关闭）。
+4. **状态与新鲜度**：`responseStatus` 必须为 `successful` 且 `certStatus` 必须为
+   `good`；`producedAt` 不得晚于 `check_time + skew`；`nextUpdate` 必填；
+   `check_time`（两侧各放宽 skew）必须落在 `thisUpdate .. nextUpdate` 窗口内。
+
+全部满足才返回 `eligible: true`；否则 `eligible: false` 并给出**稳定原因**。
+成功/失败都回显归一化后的 `check_time`、`response_status`、`cert_status`、
+`produced_at` / `this_update` / `next_update`、`responder_type`
+（`by_name` / `by_key`）以及实际验签所用证书的 `signer_fingerprint`：
+
+```json
+{
+  "eligible": true,
+  "reason": "ok",
+  "check_time": "2026-09-01T12:00:00Z",
+  "response_status": "successful",
+  "cert_status": "good",
+  "produced_at": "2026-09-01T11:55:00Z",
+  "this_update": "2026-09-01T11:00:00Z",
+  "next_update": "2026-09-08T12:00:00Z",
+  "revocation_time": null,
+  "revocation_reason": null,
+  "responder_type": "by_name",
+  "signer_fingerprint": "ef90aa96...",
+  "message": "good OCSP response signed by an authorized responder ..."
+}
+```
+
+稳定 `reason` 取值（按校验顺序，短路返回）：
+
+- `invalid_ocsp_response`：Base64 解出的 DER 不是可解析的 OCSPResponse
+  （注意：Base64 本身非法属于请求错误 `422`）。
+- `unexpected_single_response_count`：successful 响应中的 SingleResponse
+  条数不是恰好一条（装订只针对一张证书，零条或多条都无法给出单一结论）。
+- `response_not_successful`：`responseStatus` 非 successful
+  （`malformed_request` / `internal_error` / `try_later` / `sig_required` /
+  `unauthorized`），此时没有 certStatus 可看。
+- `serial_mismatch`：CertID 序列号与叶不符。
+- `certid_issuer_mismatch`：包内没有证书既密码学签发了叶、又同时匹配
+  CertID 的两个哈希。
+- `responder_untrusted`：ResponderID 既不匹配签发者，也不匹配一张直接签发、
+  当前有效且含 `id-kp-OCSPSigning` 的内嵌响应证书（缺失、过期、无 EKU、
+  非该签发者所签均归此因）。
+- `invalid_signature`：响应签名在选定签名者公钥下验证失败。
+- `certificate_revoked`：certStatus 为 revoked；额外回显 `revocation_time`
+  与 `revocation_reason`（RFC 5280 CRLReason 枚举名，如 `key_compromise`、
+  `ca_compromise`、`cessation_of_operation`；响应未给原因时按 RFC 5280
+  默认 `unspecified`）。
+- `certificate_unknown`：certStatus 为 unknown。
+- `produced_at_too_late`：`producedAt` 晚于 `check_time + skew`。
+- `missing_next_update`：singleResponse 不含必填的 `nextUpdate`。
+- `before_this_update` / `after_next_update`：`check_time`（加 skew 后）
+  早于 `thisUpdate` / 晚于 `nextUpdate`。
+
+请求信封本身错误返回 `422`，沿用归一化的错误结构：`invalid_pem`（PEM 元素
+不可解析）、`invalid_fingerprint` / `unknown_fingerprint`、
+`invalid_ocsp_response`（`ocsp_response` 不是合法 Base64）、以及
+`allowed_skew_seconds` 超出 `0..300` 的模式校验。示例请求见
+[`examples/ocsp_precheck_request.json`](examples/ocsp_precheck_request.json)，
+可用 `examples/gen_ocsp_precheck_example.py` 重新生成。
 
 ### `POST /plans` — 求最优计划
 

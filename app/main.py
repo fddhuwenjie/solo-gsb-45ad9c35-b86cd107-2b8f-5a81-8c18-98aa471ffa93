@@ -22,6 +22,8 @@ from .models import (
     NormalizeErrorDetail,
     NormalizeRequest,
     NormalizeResult,
+    OcspPrecheckRequest,
+    OcspPrecheckResult,
     PlannedStage,
     PlanRequest,
     PlanSuccess,
@@ -34,6 +36,7 @@ from .models import (
     RelationshipRef,
 )
 from .normalize import NormalizeError, normalize_scenario
+from .ocsp import precheck_ocsp
 from .precheck import precheck_identities
 from .reconcile import reconcile
 
@@ -44,6 +47,10 @@ class _NormalizeErrorResponse(BaseModel):
 
 class _PrecheckErrorResponse(BaseModel):
     detail: PrecheckErrorDetail
+
+
+class _OcspErrorResponse(BaseModel):
+    detail: NormalizeErrorDetail
 
 app = FastAPI(
     title="TLS Certificate Zero-Downtime Rotation Planner",
@@ -64,9 +71,12 @@ async def _scenario_validation_handler(_request, exc: ScenarioValidationError):
 
 @app.exception_handler(NormalizeError)
 async def _normalize_error_handler(request, exc: NormalizeError):
-    # Both /scenarios/normalize and /deployments/precheck raise NormalizeError
-    # (shared PEM/fingerprint/chain diagnostics); only the pre-check carries
-    # identity_issues, so shape the detail per route.
+    # /scenarios/normalize, /deployments/precheck and
+    # /deployments/ocsp-precheck all raise NormalizeError for shared envelope
+    # diagnostics (PEM/fingerprint); only the identity pre-check carries
+    # identity_issues, so shape the detail per route. The OCSP pre-check reuses
+    # the plain detail (its own invalid_ocsp_response code, no chain/identity
+    # sections).
     if request.url.path.startswith("/deployments/precheck"):
         detail = PrecheckErrorDetail(
             error=exc.error,
@@ -247,6 +257,31 @@ def precheck_deployment(req: PrecheckRequest) -> Any:
     failure can be diagnosed without a second round trip.
     """
     return precheck_identities(req)
+
+
+@app.post(
+    "/deployments/ocsp-precheck",
+    response_model=OcspPrecheckResult,
+    responses={422: {"model": _OcspErrorResponse}},
+    summary="Offline pre-check of a stapled OCSP response for a target leaf",
+)
+def precheck_ocsp_response(req: OcspPrecheckRequest) -> Any:
+    """Validate a Base64 DER OCSP response (RFC 6960) entirely offline,
+    reusing the same PEM bag parsing as the other deployment endpoints.
+
+    The response's CertID must name the submitted leaf (serial number plus
+    issuer name/key hashes recomputed against a certificate that
+    cryptographically signed it); the signer chosen via the ResponderID must
+    be the issuer itself or a directly issued, currently valid certificate
+    carrying id-kp-OCSPSigning, and the BasicOCSPResponse signature must
+    verify. Eligibility additionally requires successful responseStatus,
+    good certStatus, producedAt no later than check_time + skew and
+    check_time within the (thisUpdate - skew, nextUpdate + skew) window with
+    nextUpdate present. Every other outcome is ``eligible: false`` with a
+    stable reason; a revoked cert includes revocation_time and
+    revocation_reason.
+    """
+    return precheck_ocsp(req)
 
 
 @app.post(

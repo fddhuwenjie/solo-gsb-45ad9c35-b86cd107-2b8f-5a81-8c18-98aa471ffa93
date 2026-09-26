@@ -447,6 +447,133 @@ class PrecheckErrorDetail(NormalizeErrorDetail):
 
 
 # ---------------------------------------------------------------------------
+# /deployments/ocsp-precheck: offline OCSP stapling response pre-check
+# ---------------------------------------------------------------------------
+
+
+class OcspPrecheckRequest(BaseModel):
+    pem_certificates: list[str] = Field(
+        ...,
+        min_length=1,
+        description="Unordered PEM bag; same parsing/deduplication rules as "
+                    "/scenarios/normalize. Must contain the leaf identified by "
+                    "leaf_fingerprint and its issuer certificate.",
+    )
+    leaf_fingerprint: str = Field(
+        ...,
+        min_length=64,
+        description="SHA-256 fingerprint (hex, case-insensitive) of the leaf "
+                    "certificate the OCSP response is expected to be about.",
+    )
+    ocsp_response: str = Field(
+        ...,
+        min_length=1,
+        description="Base64-encoded DER OCSP response (RFC 6960) exactly as "
+                    "would be stapled on the wire; whitespace is tolerated.",
+    )
+    check_time: datetime = Field(
+        ...,
+        description="Instant at which the stapled response is evaluated "
+                    "(ISO-8601; naive datetimes are treated as UTC).",
+    )
+    allowed_skew_seconds: int = Field(
+        default=300,
+        ge=0,
+        le=300,
+        description="Tolerance for responder clock skew, applied to the "
+                    "freshness window on both sides; at most 300 seconds.",
+    )
+
+
+OCSP_REASONS = (
+    "ok",
+    "invalid_ocsp_response",
+    "unexpected_single_response_count",
+    "response_not_successful",
+    "serial_mismatch",
+    "certid_issuer_mismatch",
+    "responder_untrusted",
+    "invalid_signature",
+    "certificate_revoked",
+    "certificate_unknown",
+    "produced_at_too_late",
+    "missing_next_update",
+    "before_this_update",
+    "after_next_update",
+)
+
+
+class OcspPrecheckResult(BaseModel):
+    eligible: bool = Field(
+        ...,
+        description="True only when the response is successful, the CertID "
+                    "matches the named leaf and its issuer, the signature is "
+                    "valid under the issuer or an authorized delegated "
+                    "responder, certStatus is good, and check_time lies in the "
+                    "(thisUpdate - skew, nextUpdate + skew) window with "
+                    "producedAt no later than check_time + skew.",
+    )
+    reason: Literal[
+        "ok",
+        "invalid_ocsp_response",
+        "unexpected_single_response_count",
+        "response_not_successful",
+        "serial_mismatch",
+        "certid_issuer_mismatch",
+        "responder_untrusted",
+        "invalid_signature",
+        "certificate_revoked",
+        "certificate_unknown",
+        "produced_at_too_late",
+        "missing_next_update",
+        "before_this_update",
+        "after_next_update",
+    ]
+    check_time: datetime = Field(
+        ..., description="The evaluation instant, normalized to UTC."
+    )
+    response_status: Optional[str] = Field(
+        ...,
+        description="RFC 6960 responseStatus enum name (successful, "
+                    "malformed_request, internal_error, try_later, "
+                    "sig_required, unauthorized); null when the DER is not a "
+                    "parseable OCSPResponse.",
+    )
+    cert_status: Optional[str] = Field(
+        ...,
+        description="SingleResponse certStatus enum name (good, revoked, "
+                    "unknown); null for a non-successful or unparseable "
+                    "response.",
+    )
+    produced_at: Optional[datetime] = None
+    this_update: Optional[datetime] = None
+    next_update: Optional[datetime] = None
+    revocation_time: Optional[datetime] = Field(
+        default=None,
+        description="revocationTime (UTC) when certStatus is revoked; "
+                    "otherwise null.",
+    )
+    revocation_reason: Optional[str] = Field(
+        default=None,
+        description="RFC 5280 CRLReason enum name (e.g. key_compromise); "
+                    "null for a non-revoked response or when the responder "
+                    "omits the reason (defaults to unspecified).",
+    )
+    responder_type: Optional[Literal["by_name", "by_key"]] = Field(
+        default=None,
+        description="Which ResponderID form the response carries; null for a "
+                    "non-successful or unparseable response.",
+    )
+    signer_fingerprint: Optional[str] = Field(
+        default=None,
+        description="SHA-256 fingerprint of the certificate whose public key "
+                    "verified the response signature (the issuer itself or a "
+                    "delegated id-kp-OCSPSigning responder certificate).",
+    )
+    message: str
+
+
+# ---------------------------------------------------------------------------
 # /plans/reconcile: infer a safe resumption point after a deployment outage
 # ---------------------------------------------------------------------------
 

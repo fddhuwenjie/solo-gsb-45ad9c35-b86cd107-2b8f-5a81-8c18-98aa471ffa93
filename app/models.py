@@ -1,7 +1,7 @@
 """Pydantic models for the certificate rotation planning API."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -444,6 +444,145 @@ class PrecheckIdentityIssue(BaseModel):
 
 class PrecheckErrorDetail(NormalizeErrorDetail):
     identity_issues: list[PrecheckIdentityIssue] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# /deployments/ocsp-precheck: offline check of a stapled OCSP response
+# ---------------------------------------------------------------------------
+
+MAX_OCSP_SKEW_SECONDS = 300
+
+
+class OcspPrecheckRequest(BaseModel):
+    """One stapled OCSP response, checked offline against the PEM bundle.
+
+    The bundle must contain the leaf and the certificate that issued it; the
+    issuer is established by signature verification (never by DN matching),
+    exactly as in /scenarios/normalize. No trust roots are required: a
+    stapled response is validated against the leaf's direct issuer alone.
+    """
+
+    pem_certificates: list[str] = Field(
+        ...,
+        min_length=1,
+        description="Unordered PEM bag; same parsing/deduplication rules as "
+                    "/scenarios/normalize. Must contain the leaf and its "
+                    "issuer.",
+    )
+    leaf_fingerprint: str = Field(
+        ...,
+        min_length=64,
+        description="SHA-256 fingerprint (hex, case-insensitive) of the leaf "
+                    "certificate the stapled response speaks for.",
+    )
+    ocsp_response: str = Field(
+        ...,
+        min_length=1,
+        description="Base64-encoded DER OCSP response, exactly as stapled "
+                    "(ASCII whitespace inside the blob is ignored).",
+    )
+    check_time: datetime = Field(
+        ...,
+        description="Validation instant (ISO-8601; naive datetimes are "
+                    "treated as UTC).",
+    )
+    max_skew_seconds: int = Field(
+        default=0,
+        ge=0,
+        le=MAX_OCSP_SKEW_SECONDS,
+        description="Clock skew tolerance in seconds applied to producedAt "
+                    "and the thisUpdate/nextUpdate window; at most 300.",
+    )
+
+    @field_validator("check_time")
+    @classmethod
+    def _check_time_utc(cls, v: datetime) -> datetime:
+        # Same convention as Certificate: naive instants are UTC.
+        if v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v.astimezone(timezone.utc)
+
+
+OcspPrecheckReason = Literal[
+    "ok",
+    "invalid_ocsp_response",
+    "response_not_successful",
+    "issuer_not_found",
+    "cert_id_mismatch",
+    "responder_not_found",
+    "unauthorized_responder",
+    "signature_invalid",
+    "certificate_revoked",
+    "certificate_unknown",
+    "produced_at_in_future",
+    "next_update_missing",
+    "response_not_yet_valid",
+    "response_stale",
+]
+
+
+class OcspPrecheckResult(BaseModel):
+    """Verdict for one stapled OCSP response.
+
+    Every check failure is reported as ``eligible: false`` with a stable,
+    machine-readable ``reason`` (the reasons are listed in precedence
+    order); only a fully authentic, timely, good-status response yields
+    ``eligible: true``.
+    """
+
+    leaf_fingerprint: str
+    issuer_fingerprint: Optional[str] = Field(
+        ...,
+        description="Fingerprint of the bundle certificate that verifiably "
+                    "signed the leaf and matches the response CertID; null "
+                    "when no issuer matched.",
+    )
+    eligible: bool
+    reason: OcspPrecheckReason
+    message: str
+    response_status: Optional[str] = Field(
+        ...,
+        description="OCSP response status (successful, malformed_request, "
+                    "internal_error, try_later, sig_required, unauthorized); "
+                    "null when the response could not be parsed at all.",
+    )
+    certificate_status: Optional[str] = Field(
+        ...,
+        description="good / revoked / unknown; null unless the response was "
+                    "successful.",
+    )
+    responder_id_type: Optional[Literal["name", "key_hash"]] = Field(
+        ...,
+        description="Which responderID form the response carries.",
+    )
+    signer_type: Optional[Literal["issuer", "responder_certificate"]] = Field(
+        ...,
+        description="Who was selected to sign: the issuer itself, or a "
+                    "delegated responder certificate embedded in the "
+                    "response.",
+    )
+    signer_fingerprint: Optional[str] = Field(
+        ...,
+        description="SHA-256 fingerprint of the selected signer certificate.",
+    )
+    produced_at: Optional[datetime] = Field(
+        ..., description="Response producedAt (UTC); null when unparseable."
+    )
+    this_update: Optional[datetime] = Field(
+        ..., description="Single-response thisUpdate (UTC)."
+    )
+    next_update: Optional[datetime] = Field(
+        ..., description="Single-response nextUpdate (UTC); null when the "
+                    "response omits it (which is itself a failure).",
+    )
+    revocation_time: Optional[datetime] = Field(
+        ..., description="Revocation instant (UTC) when the status is "
+                    "revoked and the response carries it; null otherwise.",
+    )
+    revocation_reason: Optional[str] = Field(
+        ..., description="CRL reason flag name (e.g. key_compromise) when "
+                    "revoked and present; null otherwise.",
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -137,27 +137,29 @@ def _load_pem_bundle(
 # ---------------------------------------------------------------------------
 
 
-def _verify_signature(child: x509.Certificate, issuer: x509.Certificate) -> bool:
-    """True iff ``child`` was signed by ``issuer``'s private key.
+def _verify_signed_data(
+    public_key,
+    signature: bytes,
+    tbs: bytes,
+    hash_algo,
+    signature_algorithm_oid: str,
+    signature_algorithm_parameters,
+) -> bool:
+    """Verify ``signature`` over ``tbs`` with ``public_key``.
 
-    InvalidSignature is the ordinary "not an issuer" answer; unsupported key
-    types or algorithms simply yield False so the bundle stays processable.
+    Shared core of certificate issuance checks and OCSP response
+    verification. InvalidSignature is the ordinary "did not sign" answer;
+    unsupported key types or algorithms simply yield False so the bundle
+    stays processable.
     """
-    public_key = issuer.public_key()
-    signature = child.signature
-    tbs = child.tbs_certificate_bytes
-    hash_algo = child.signature_hash_algorithm
-
     try:
         if isinstance(public_key, (ed25519.Ed25519PublicKey,
                                    getattr(ed448, "Ed448PublicKey", ()))):
             # PureEdDSA: the signed data itself identifies the algorithm.
             public_key.verify(signature, tbs)
         elif isinstance(public_key, rsa.RSAPublicKey):
-            if child.signature_algorithm_oid.dotted_string == _RSASSA_PSS_OID:
-                parameters = getattr(
-                    child, "signature_algorithm_parameters", None
-                ) or padding.PSS(
+            if signature_algorithm_oid == _RSASSA_PSS_OID:
+                parameters = signature_algorithm_parameters or padding.PSS(
                     mgf=padding.MGF1(hash_algo),
                     salt_length=hash_algo.digest_size,
                 )
@@ -175,6 +177,18 @@ def _verify_signature(child: x509.Certificate, issuer: x509.Certificate) -> bool
     except (InvalidSignature, UnsupportedAlgorithm, TypeError, ValueError):
         return False
     return True
+
+
+def _verify_signature(child: x509.Certificate, issuer: x509.Certificate) -> bool:
+    """True iff ``child`` was signed by ``issuer``'s private key."""
+    return _verify_signed_data(
+        issuer.public_key(),
+        child.signature,
+        child.tbs_certificate_bytes,
+        child.signature_hash_algorithm,
+        child.signature_algorithm_oid.dotted_string,
+        getattr(child, "signature_algorithm_parameters", None),
+    )
 
 
 def _build_issuer_edges(

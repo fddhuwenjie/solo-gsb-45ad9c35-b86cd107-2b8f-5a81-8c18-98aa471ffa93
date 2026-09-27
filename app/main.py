@@ -22,6 +22,8 @@ from .models import (
     NormalizeErrorDetail,
     NormalizeRequest,
     NormalizeResult,
+    OcspPrecheckRequest,
+    OcspPrecheckResult,
     PlannedStage,
     PlanRequest,
     PlanSuccess,
@@ -34,6 +36,7 @@ from .models import (
     RelationshipRef,
 )
 from .normalize import NormalizeError, normalize_scenario
+from .ocsp import ocsp_precheck
 from .precheck import precheck_identities
 from .reconcile import reconcile
 
@@ -247,6 +250,33 @@ def precheck_deployment(req: PrecheckRequest) -> Any:
     failure can be diagnosed without a second round trip.
     """
     return precheck_identities(req)
+
+
+@app.post(
+    "/deployments/ocsp-precheck",
+    response_model=OcspPrecheckResult,
+    responses={422: {"model": _NormalizeErrorResponse}},
+    summary="Offline pre-check of a stapled OCSP response for one leaf",
+)
+def ocsp_precheck_deployment(req: OcspPrecheckRequest) -> Any:
+    """Validate a stapled OCSP response offline against the PEM bundle.
+
+    The leaf's issuer is established by signature verification inside the
+    bundle (same machinery as /scenarios/normalize; no trust roots needed).
+    The response CertID is checked against the leaf's serial number and the
+    issuer's name/key hashes; the signer is selected by
+    responderName/responderKeyHash and must be the issuer itself or a
+    delegated responder certificate (directly issued by the issuer, valid at
+    ``check_time``, carrying id-kp-OCSPSigning) whose signature is verified.
+    The response must be successful with certificate status good, producedAt
+    no later than ``check_time`` plus the skew allowance (at most 300s), and
+    ``check_time`` must fall inside the thisUpdate/nextUpdate window widened
+    by that skew; nextUpdate is required. Every failure returns 200 with
+    ``eligible: false`` and a stable machine-readable reason (revoked
+    verdicts also carry the revocation time and reason); malformed requests
+    (bad fingerprint, unknown leaf, unparseable PEM) return 422.
+    """
+    return ocsp_precheck(req)
 
 
 @app.post(

@@ -9,6 +9,8 @@
 安全的下一步动作。
 另提供**部署身份预检**：在规划前校验目标叶证书的 SAN 是否覆盖端点声明的
 DNS/IP 身份，并沿链累计中间 CA 的名称约束（excluded 优先、permitted 取交集）。
+以及 **OCSP 装订响应离线预检**：不上网、不连响应器，直接校验端点将装订的
+OCSP 响应是否由签发者（或其授权响应证书）签名、状态为 good 且在有效期内。
 
 ## 一键启动
 
@@ -194,6 +196,87 @@ curl -s http://localhost:8080/deployments/precheck \
 `pem_issues` / `fingerprint_issues` / `chain_issues`），并额外提供
 `identity_issues`（非法 DNS/IP 身份、重复身份，错误码 `invalid_identity`）；
 链无法唯一解析时同样返回 `no_trust_path` / `ambiguous_chain`。
+
+### `POST /deployments/ocsp-precheck` — OCSP 装订响应离线预检
+
+在端点装订（staple）OCSP 响应之前，离线验证该响应届时是否可被客户端接受：
+全程不访问网络，只用与归一化接口相同的 PEM 包（同样的解析、去重、签名验证
+规则；**不需要信任根**，装订响应只对叶证书的直接签发者求值）：
+
+```bash
+curl -s http://localhost:8080/deployments/ocsp-precheck \
+  -H 'Content-Type: application/json' \
+  --data @examples/ocsp_precheck_request.json
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `pem_certificates` | 与 `/scenarios/normalize` 相同的 PEM 包；必须包含叶证书及其签发者 |
+| `leaf_fingerprint` | 叶证书的 SHA-256 指纹（十六进制，大小写不敏感） |
+| `ocsp_response` | Base64 编码的 DER OCSP 响应（即端点将装订的原文；内部空白字符会被忽略） |
+| `check_time` | 校验时刻（ISO-8601；裸时间按 UTC 处理） |
+| `max_skew_seconds` | 时钟偏差容忍秒数，**最多 300**，缺省 0 |
+
+校验按固定优先级依次进行，首个失败即决定返回的 `reason`：
+
+1. **解析**：`ocsp_response` 必须是可解析的 Base64 DER OCSP 响应
+   （否则 `invalid_ocsp_response`）。
+2. **响应状态**：必须为 `successful`（否则 `response_not_successful`，
+   此类响应不携带任何证书状态字段）。
+3. **签发者**：PEM 包内必须存在**经签名验证**确实签发了叶证书的证书
+   （否则 `issuer_not_found`）。
+4. **CertID 核对**：响应 CertID 的序列号必须等于叶证书序列号，且
+   `issuerNameHash` / `issuerKeyHash` 必须用响应自带的哈希算法对签发者的
+   DER Name 与 subjectPublicKey 位串重算吻合（否则 `cert_id_mismatch`）。
+5. **签名者选定**：按 `responderName` 或 `responderKeyHash`（对
+   subjectPublicKey 位串的 SHA-1）在「签发者 + 响应内嵌证书」中选定签名者
+   （否则 `responder_not_found`）；签名者必须是**签发者本身**，或是
+   **签发者直接签发、在 `check_time` 有效、且含 `id-kp-OCSPSigning` 扩展
+   密钥用途**的响应证书（否则 `unauthorized_responder`）。
+6. **验签**：用选定签名者的公钥验证响应签名（否则 `signature_invalid`）。
+7. **证书状态**：必须为 `good`；`revoked` 返回 `certificate_revoked` 并附
+   `revocation_time` / `revocation_reason`，`unknown` 返回
+   `certificate_unknown`。
+8. **时效**：`producedAt` 不得晚于 `check_time + max_skew_seconds`
+   （否则 `produced_at_in_future`）；响应**必须携带 `nextUpdate`**
+   （否则 `next_update_missing`）；`check_time` 必须落在
+   `[thisUpdate − skew, nextUpdate + skew]` 窗口内（过早
+   `response_not_yet_valid`，过期 `response_stale`）。
+
+全部通过才返回 `eligible: true`。失败一律返回 `200` + `eligible: false` +
+稳定机器可读 `reason`（另附人类可读 `message` 与已查明的上下文字段
+`response_status` / `certificate_status` / `responder_id_type` /
+`signer_type` / `signer_fingerprint` / 各时间戳）：
+
+```json
+{
+  "leaf_fingerprint": "2a8b29ba...",
+  "issuer_fingerprint": "8c60ddc7...",
+  "eligible": true,
+  "reason": "ok",
+  "message": "the stapled response is authentic, timely and certifies the leaf as good at check_time",
+  "response_status": "successful",
+  "certificate_status": "good",
+  "responder_id_type": "key_hash",
+  "signer_type": "responder_certificate",
+  "signer_fingerprint": "8a18cc66...",
+  "produced_at": "2026-09-27T00:35:23Z",
+  "this_update": "2024-01-01T00:00:00Z",
+  "next_update": "2035-01-01T00:00:00Z",
+  "revocation_time": null,
+  "revocation_reason": null
+}
+```
+
+请求级错误（指纹格式非法、叶指纹不在包内、PEM 无法解析）返回 `422`，
+结构与归一化接口一致（`invalid_fingerprint` / `unknown_fingerprint` /
+`invalid_pem`）。示例见
+[`examples/ocsp_precheck_request.json`](examples/ocsp_precheck_request.json)，
+可用 `examples/gen_ocsp_precheck_example.py` 重新生成（响应窗口
+2024–2035、`check_time` 固定为 2030-01-01，重新生成后多年内保持
+`eligible: true`）。
 
 ### `POST /plans` — 求最优计划
 
